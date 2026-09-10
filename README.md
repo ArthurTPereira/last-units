@@ -1,4 +1,4 @@
-# Recurring stock orders
+# Last units
 
 A purchase service with limited stock, built around a rule that cannot be broken:
 
@@ -9,10 +9,14 @@ This project doesn't have a UI. Its purpose is to prove that the system solves t
 ---
 ## The proof
 
+You need Docker running, since the tests start a real Postgres container, and a JDK 25.
+
 ```bash
 cd app
-.\mvnw.cmd test
+./mvnw test
 ```
+
+On Windows, `.\mvnw.cmd test`.
 
 Run one command and you'll get two passing tests. The first one shows the bug actually happens, and the second one shows it's fixed. Under the hood, they both spin up a fresh Postgres container via Testcontainers, stock 3 items, and hit the system with 200 simultaneous buy requests at the exact same time.
 
@@ -39,7 +43,7 @@ counter consistent .............. false
 
 Eleven units sold from a stock of 3, with no exception and no error in any log.
 
-This test passes when the invariant fails. We aren't just guessing that the bug happened and got fixed, we are proving it. It reproduces the failure on every build, fluctuating between 11 and 32 failures per run, according to my measurements. The instability is part of what makes the bug hard to notice in production.
+This test passes when the invariant fails. We aren't just guessing that the bug happened and got fixed, we are proving it. It reproduces the failure on every build, fluctuating between 11 and 32 units sold from a stock of 3, according to my measurements. The instability is part of what makes the bug hard to notice in production.
 
 
 ### `ConcurrentPurchaseTest`, V2 with pessimistic locking
@@ -78,13 +82,13 @@ The violation only appears when you compare the counter against the recorded ord
 
 ## Why the fix works
 
-Not because it locks. Both experiments below produce waiting and give opposite results:
+Not because it locks. The clearest evidence came from the manual `psql` experiments, on a smaller scene: an account holding 100, two sessions each withdrawing 10, so the only correct ending is 80. Both experiments below produce waiting, and give opposite results:
 
 | | Naive V1 | V2 with `FOR UPDATE` |
 |---|---|---|
 | Where the waiting happens | after the decision | at the read, before the decision |
 | Value written | computed from stale data | computed from fresh data |
-| Result | 90, wrong | 80, correct |
+| Balance left | 90, wrong | 80, correct |
 
 With V1, the transaction paused, woke back up, and blindly wrote the stale data it computed beforehand. The locking mechanism saved the write operation, but it completely missed the decision-making logic.
 
@@ -94,16 +98,18 @@ With `SELECT ... FOR UPDATE` the wait happens at the read. When the transaction 
 
 ## What the fix cost
 
+Same scenario on both sides: 200 concurrent clients, 3 units in stock, connection pool of 10.
+
 | | V1 | V2 | Cost |
 |---|---|---|---|
 | p50 | 305 to 364 ms | 504 to 560 ms | about 1.6x |
 | p95 | 402 to 497 ms | 740 to 803 ms | about 1.7x |
 
-We wrote the prediction down before we even started: this lock covers the whole flow, not just one query. Think about everything happening between the initial `SELECT` and the final `COMMIT`. We have the network, app logic, the both writes. They are all extending how long the lock is held.
+We wrote the prediction down before we even started: this lock covers the whole flow, not just one query. Think about everything happening between the initial `SELECT` and the final `COMMIT`. We have the network, the app logic, both writes. They are all extending how long the lock is held.
 
 ---
 
-## Where it breaks
+## Where it degrades
 
 A load sweep, with stock always at 3 units:
 
@@ -119,7 +125,7 @@ Always 3. Tripling the load and scaling up the connection pool didn't change the
 
 ### Two interesting findings
 
-Widening the connection pool actually made things worse. Pumping it from 10 to 50 connections pushed the p50 latency up from roughly 300-360ms to over 440ms. The real bottleneck is row contention, not the connection queue.
+Widening the connection pool actually made things worse. In a separate run, outside the sweep above, going from 10 to 50 connections pushed p50 up from 305-364 ms to 442-464 ms. The real bottleneck is row contention, not the connection queue: with 10 connections only 10 requests fight over the same row at a time, and the pool was acting as a concurrency limiter nobody had designed.
 
 Relying on database timeouts doesn't work for response budgets. Even with 1570 ms latencies under heavy load, the 1-second `lock_timeout` stayed silent. The actual row lock only takes 200ms to 1s. The extra time is spent waiting in the connection queue before hitting the database.
 
@@ -144,6 +150,8 @@ Before any code, the anomalies were reproduced by hand, in two `psql` sessions s
 | Write skew | `repeatable read` does not prevent it; `serializable` does, by aborting, and signals a retry |
 | `FOR UPDATE` | waiting at the read produces a decision on fresh data; `NOWAIT`, `lock_timeout` and deadlock reproduced |
 
+The raw working notes behind all of this, including the ANSI SQL anomaly matrix, are in [notes/](notes/).
+
 ---
 
 ## Decisions
@@ -159,7 +167,7 @@ The full record is in [docs/product-decisions.md](docs/product-decisions.md) and
 | D5 | `lock_timeout` 1 s, total budget 3 s | derived from measurement, revised after V2 |
 | D6 | Nobody fails from routine conflict; everyone waits | higher latency and a serialization point |
 
-The chosen mechanism is pessimistic row locking (`SELECT ... FOR UPDATE`), out of a funnel of 7 candidates. The eliminations are split between those made on a structural property and those made on a product decision. The optimistic version and `SERIALIZABLE` are technically adequate for the problem and were discarded not because it is unable to solve it, but by a behavioural choice: [docs/phase-3-mechanisms.md](docs/phase-3-mechanisms.md).
+The chosen mechanism is pessimistic row locking (`SELECT ... FOR UPDATE`), out of a funnel of 7 candidates. The eliminations are split between those made on a structural property and those made on a product decision. The optimistic version and `SERIALIZABLE` are technically adequate for the problem and were discarded not because they are unable to solve it, but by a behavioural choice: [docs/phase-3-mechanisms.md](docs/phase-3-mechanisms.md).
 
 ---
 ## Stack
@@ -170,3 +178,8 @@ Java 25, Spring Boot 4.1.1, Spring Data JPA, PostgreSQL 17, Flyway, Testcontaine
 ## How this was built
 
 The decisions here are all mine, including the invariant, product rules, the mechanism and the trade-offs accepted. I worked with an AI assistant as an adversary and reviewer, which argued against my choices, wrote the tests and the infrastructure, and helped reproduce the anomalies by hand in psql. Every experiment had a written prediction before it ran, and the predictions are recorded, including the ones that turned out wrong.
+
+---
+## License
+
+MIT, see [LICENSE](LICENSE).
